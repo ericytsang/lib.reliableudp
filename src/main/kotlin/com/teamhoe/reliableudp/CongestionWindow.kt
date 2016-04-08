@@ -74,10 +74,6 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
      */
     fun put(packets:Iterable<ISeqPacket>):Unit = lock.withLock()
     {
-        // wait for there to be room in the congestion window
-        while (bytesInFlight > maxBytesInFlight)
-            signaledOnNetworkAvailable.await()
-
         packets.forEach()
         {
             // put the packet into the queue so we can calculate RTT
@@ -133,33 +129,29 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
             return@removeAll shouldRemove
         }
 
+        // reset consecutive dropped packet count
+        consecutiveDroppedPacketCount = 0
+
         // update remote receive window size
         maxSequenceNumber = (acknowledgementNumber.toLong()+windowSize.value).toInt()
 
         // signal condition met
         if (bytesInFlight < maxBytesInFlight)
             signaledOnNetworkAvailable.signalAll()
-
-        // signal threads awaiting acks
-        awaitAckCoundDownLatches[acknowledgementNumber]?.let()
-        {
-            latch ->
-            latch.countDown()
-            awaitAckCoundDownLatches.remove(acknowledgementNumber)
-        }
     }
 
-    private val awaitAckCoundDownLatches = LinkedHashMap<Int,CountDownLatch>()
-    fun awaitAck(sequenceNumber:Int)
+    fun flush() = lock.withLock()
     {
-        val latch = awaitAckCoundDownLatches.getOrPut(sequenceNumber,{CountDownLatch(1)})
-        latch.await()
+        while(unackedPackets.isNotEmpty() || pendingToSendPackets.isNotEmpty() || pendingForAckPackets.isNotEmpty())
+            signaledOnNetworkAvailable.await()
     }
 
     /**
      * removes the next packet that is ready for transmission or retransmission
      * because the network is free.
      */
+    var consecutiveDroppedPacketCount = 0
+        private set
     var packetsDropped = 0
     fun take():ISeqPacket
     {
@@ -191,6 +183,7 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
             estimatedRtt = Math.min(estimatedRtt*2,Double.MAX_VALUE)
             isSlowStart = false
             maxBytesInFlight -= packet.datagram.length
+            consecutiveDroppedPacketCount++
             rePut(packet)
 
             println("$this: estimatedRtt: $estimatedRtt, maxBytesInFlight: ${maxBytesInFlight}, packetsDropped: ${++packetsDropped}")

@@ -1,6 +1,7 @@
 package com.teamhoe.reliableudp
 
 import com.teamhoe.reliableudp.net.*
+import java.io.Closeable
 import java.net.ConnectException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -14,13 +15,19 @@ import kotlin.concurrent.thread
 /**
  * Created by Eric on 4/7/2016.
  */
-class ServerSocket(private val port:Int? = null)
+class ServerSocket(private val port:Int? = null):Closeable
 {
     companion object
     {
         const val NUM_SYN_TO_SEND_FOR_CONNECT = 5
         const val DEFAULT_WINDOW_SIZE = Int.MAX_VALUE
+        const val MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS = 3
+        const val ESTIMATED_RTT_ERR_MARGIN = 500L
+        const val INITIAL_ESTIMATED_RTT = 5000.0
+        const val INITIAL_MAX_BYTES_IN_FLIGHT = 1.0
     }
+
+    val localPort:Int get() = udpSocket.localPort
 
     internal val udpSocket = port?.let {DatagramSocket(port)} ?: DatagramSocket()
 
@@ -34,7 +41,7 @@ class ServerSocket(private val port:Int? = null)
      * blocks until a connection request was received, and accepted. returns a
      * [SocketInputStream].
      */
-    fun accept(timeout:Long?):SocketInputStream
+    fun accept(timeout:Long? = null):SocketInputStream
     {
         val seqReceiver = AcceptRequestSeqReceiverAdapter(AcceptRequest())
         val acceptRequest = seqReceiver.wrapee
@@ -65,7 +72,7 @@ class ServerSocket(private val port:Int? = null)
      * [remoteAddress]. throws [ConnectException] if the connection request
      * times out.
      */
-    fun connect(remoteAddress:SocketAddress,timeout:Long):SocketOutputStream
+    fun connect(remoteAddress:SocketAddress,timeout:Long? = null):SocketOutputStream
     {
         // check for conflicting connection then register request to make sure
         // there is only one output stream to each remote address from this
@@ -97,10 +104,15 @@ class ServerSocket(private val port:Int? = null)
         // replace ack receiver with output stream otherwise
         else
         {
-            val outputStream = SocketOutputStream(/*todo*/)
+            val outputStream = SocketOutputStream(this,remoteAddress,connectRequest.initialSequenceNumber+1,MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS,ESTIMATED_RTT_ERR_MARGIN,INITIAL_ESTIMATED_RTT,INITIAL_MAX_BYTES_IN_FLIGHT)
             synchronized(ackReceivers) {ackReceivers[remoteAddress] = SocketOutputStreamAckReceiverAdapter(outputStream)}
             return outputStream
         }
+    }
+
+    override fun close()
+    {
+        udpSocket.close()
     }
 
     private val receiveThread = thread(isDaemon = true,name = "$this.receiveThread")
@@ -115,13 +127,13 @@ class ServerSocket(private val port:Int? = null)
             // handle packet based on type
             when (packet)
             {
-                // let sequenced packets be handled by input streams
+            // let sequenced packets be handled by input streams
                 is ISeqPacket ->
                 {
                     (seqReceivers[packet.remoteAddress] ?: pendingAccepts.firstOrNull())?.receive(packet)
                 }
 
-                // let acknowledgement packets be handled by output streams
+            // let acknowledgement packets be handled by output streams
                 is IAckPacket ->
                 {
                     ackReceivers[packet.remoteAddress]?.receive(packet)
