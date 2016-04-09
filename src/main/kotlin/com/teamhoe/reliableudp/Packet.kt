@@ -13,7 +13,7 @@ internal interface Packet
         val SIZE_OF_INT:Int = 4
         val SIZE_OF_DOUBLE:Int = 8
         val DATA_PACKET_HEADER_LEN:Int = 8
-        val MAX_PROTOCOL_DATAGRAM_PAYLOAD_LEN:Int = 1400
+        val MAX_PROTOCOL_DATAGRAM_PAYLOAD_LEN:Int = 128
 
         fun parse(datagramPacket:DatagramPacket):Packet
         {

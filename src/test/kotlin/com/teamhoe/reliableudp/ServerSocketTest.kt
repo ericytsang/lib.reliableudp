@@ -3,6 +3,7 @@ package com.teamhoe.reliableudp
 import org.junit.Test
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.net.InetSocketAddress
 import java.util.concurrent.CyclicBarrier
 import kotlin.concurrent.thread

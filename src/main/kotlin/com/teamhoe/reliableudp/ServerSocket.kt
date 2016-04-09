@@ -21,12 +21,12 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
     companion object
     {
         const val NUM_SYN_TO_SEND_FOR_CONNECT:Int = 5
-        const val DEFAULT_WINDOW_SIZE:Int = 5000
+        const val DEFAULT_WINDOW_SIZE:Int = Int.MAX_VALUE
         const val MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS:Int = 3
-        const val ESTIMATED_RTT_ERR_MARGIN:Long = 100L
+        const val ESTIMATED_RTT_ERR_MARGIN:Long = 500L
         const val INITIAL_ESTIMATED_RTT:Double = 5000.0
         const val INITIAL_MAX_BYTES_IN_FLIGHT:Double = 10.0
-        const val RTT_TIMEOUT_MULTIPLIER:Long = 1L
+        const val RTT_TIMEOUT_MULTIPLIER:Double = 2.0
 
         @Throws(IOException::class)
         fun make(port:Int? = null) = ServerSocket(port)
@@ -46,8 +46,6 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
 
     private val pendingAcceptsQueue:Queue<SeqReceiver> = LinkedBlockingQueue()
 
-    private val pendingAcceptsMap:MutableMap<SocketAddress,SeqReceiver> = LinkedHashMap()
-
     /**
      * blocks until a connection request was received, and accepted. returns a
      * [SocketInputStream].
@@ -57,35 +55,44 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
     {
         assert(isBound && !isClosed)
 
-        val seqReceiver = AcceptRequestSeqReceiverAdapter(AcceptRequest())
+        // check for conflicting connection then register request to make sure
+        // there is only one output stream to each remote address from this
+        // socket
+        val seqReceiver = synchronized(seqReceivers)
+        {
+            if (remoteAddress != null)
+            {
+                if (seqReceivers[remoteAddress] != null)
+                {
+                    throw IllegalArgumentException("conflicting ongoing connection present")
+                }
+                else
+                {
+                    val seqReceiver = AcceptRequestSeqReceiverAdapter(AcceptRequest())
+                    seqReceivers[remoteAddress] = seqReceiver
+                    return@synchronized seqReceiver
+                }
+            }
+            else
+            {
+                val seqReceiver = AcceptRequestSeqReceiverAdapter(AcceptRequest())
+                pendingAcceptsQueue.add(seqReceiver)
+                return@synchronized seqReceiver
+            }
+        }
         val acceptRequest = seqReceiver.wrapee
-
-        // registers input stream into queue of input streams pending to accept
-        // new connection requests
-        if (remoteAddress != null)
-        {
-            pendingAcceptsMap[remoteAddress] = seqReceiver
-        }
-        else
-        {
-            pendingAcceptsQueue.add(seqReceiver)
-        }
 
         // await acceptance of connection request
         acceptRequest.awaitEstablished(timeout)
 
         // once connect request is received, remove accept request from pending
         // collection, and register a socket input stream in its place
-        val inputStream = SocketInputStream(this,acceptRequest.syn!!.remoteAddress,RTT_TIMEOUT_MULTIPLIER,acceptRequest.syn!!.sequenceNumber,DEFAULT_WINDOW_SIZE)
+        val inputStream = SocketInputStream(this,acceptRequest.syn!!.remoteAddress,ESTIMATED_RTT_ERR_MARGIN,RTT_TIMEOUT_MULTIPLIER,acceptRequest.syn!!.sequenceNumber,DEFAULT_WINDOW_SIZE)
         inputStream.receive(acceptRequest.syn!!)
         synchronized(seqReceivers)
         {
             seqReceivers[acceptRequest.syn!!.remoteAddress] = SocketInputStreamSeqReceiverAdapter(inputStream)
-            if (remoteAddress != null)
-            {
-                pendingAcceptsMap.remove(remoteAddress)
-            }
-            else
+            if (remoteAddress == null)
             {
                 pendingAcceptsQueue.remove(seqReceiver)
             }
@@ -163,7 +170,7 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
             // let sequenced packets be handled by input streams
                 is ISeqPacket ->
                 {
-                    (seqReceivers[packet.remoteAddress] ?: pendingAcceptsMap[packet.remoteAddress] ?: pendingAcceptsQueue.firstOrNull())?.receive(packet)
+                    (seqReceivers[packet.remoteAddress] ?: pendingAcceptsQueue.firstOrNull())?.receive(packet)
                 }
 
             // let acknowledgement packets be handled by output streams

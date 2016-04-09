@@ -104,11 +104,11 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
                 if (isSlowStart)
                     maxBytesInFlight += packetLength
                 else
-                    maxBytesInFlight += (packetLength.toFloat()/(bytesInFlight/packetLength.toFloat()))*10
+                    maxBytesInFlight += (packetLength.toFloat()/Math.max(maxBytesInFlight.toFloat()/packetLength.toFloat(),1.0F))
 
                 // update estimated round trip time
                 val packetRtt = System.currentTimeMillis()-it.initialTransmissionTime+estimatedRttErrorMargin
-                estimatedRtt += (0.1*(packetRtt-estimatedRtt)).toLong()
+                estimatedRtt += (0.75*(packetRtt-estimatedRtt)).toLong()
             }
 
             // return true to remove; false otherwise
@@ -177,7 +177,7 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
         {
             val dequeueTimeMillis = timeTransmitted+delay
             val delay = dequeueTimeMillis-System.currentTimeMillis()
-            return Math.min(unit.convert(delay,TimeUnit.MILLISECONDS),1000)
+            return Math.max(0,Math.min(unit.convert(delay,TimeUnit.MILLISECONDS),1000))
         }
 
         override fun compareTo(other:Delayed):Int

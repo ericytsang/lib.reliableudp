@@ -16,9 +16,9 @@ import kotlin.concurrent.thread
 /**
  * Created by Eric on 4/8/2016.
  */
-class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAddress,rttTimeoutMultiplier:Long,initialSequenceNumber:Int,maxWindowSize:Int):InputStream()
+class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAddress,rttErrorMargin:Long,rttTimeoutMultiplier:Double,initialSequenceNumber:Int,maxWindowSize:Int):InputStream()
 {
-    private var state:State = EstablishedState(this,ReceiveWindow(initialSequenceNumber,maxWindowSize),rttTimeoutMultiplier)
+    private var state:State = EstablishedState(this,ReceiveWindow(initialSequenceNumber,maxWindowSize),rttErrorMargin,rttTimeoutMultiplier)
     internal fun receive(packet:ISeqPacket) = state.receive(packet)
     override fun available():Int = state.available()
     override fun read():Int
@@ -47,7 +47,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
         fun close()
     }
 
-    private class EstablishedState(val context:SocketInputStream,val recvWnd:ReceiveWindow,val rttTimeoutMultiplier:Long):State
+    private class EstablishedState(val context:SocketInputStream,val recvWnd:ReceiveWindow,val rttErrorMargin:Long,val rttTimeoutMultiplier:Double):State
     {
         private var estimatedRtt:Double = 0.0
 
@@ -75,7 +75,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
                 }
                 else if (nextPacket is FinPacket)
                 {
-                    context.state = EofState(context,nextPacket,rttTimeoutMultiplier)
+                    context.state = EofState(context,nextPacket,rttErrorMargin,rttTimeoutMultiplier)
                     return context.state.read(b,off,len)
                 }
             }
@@ -88,23 +88,16 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
 
         override fun close()
         {
-            var nextPacket:ISeqPacket? = null
-            val takeThread = thread()
-            {
-                nextPacket = recvWnd.take()
-            }
-            takeThread.join(estimatedRtt.toLong())
-            takeThread.interrupt()
-
+            val nextPacket = recvWnd.take()
             if (nextPacket is FinPacket)
             {
-                val eofState = EofState(context,nextPacket!!,rttTimeoutMultiplier)
+                val eofState = EofState(context,nextPacket,rttErrorMargin,rttTimeoutMultiplier)
                 context.state = eofState
                 eofState.awaitClosed()
             }
             else
             {
-                throw IOException("output stream wasn't closed")
+                throw IOException("remote output stream wasn't closed: $nextPacket")
             }
         }
     }
@@ -121,7 +114,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
         override fun close() {}
     }
 
-    private class EofState(val context:SocketInputStream,finPacket:ISeqPacket,val rttTimeoutMultiplier:Long):State
+    private class EofState(val context:SocketInputStream,finPacket:ISeqPacket,val rttErrorMargin:Long,val rttTimeoutMultiplier:Double):State
     {
         var delayedCloseThread = Thread()
         val signaledOnClose = CountDownLatch(1)
@@ -137,7 +130,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
             {
                 try
                 {
-                    Thread.sleep(packet.estimatedRtt.toLong()*rttTimeoutMultiplier)
+                    Thread.sleep((packet.estimatedRtt*rttTimeoutMultiplier+rttErrorMargin).toLong())
                     context.serverSocket.seqReceivers.remove(context.remoteAddress)
                     context.state = ClosedState(context)
                     signaledOnClose.countDown()
