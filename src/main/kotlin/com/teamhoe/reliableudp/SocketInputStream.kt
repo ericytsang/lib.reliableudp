@@ -16,9 +16,9 @@ import kotlin.concurrent.thread
 /**
  * Created by Eric on 4/8/2016.
  */
-class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAddress,rttErrorMargin:Long,rttTimeoutMultiplier:Double,initialSequenceNumber:Int,maxWindowSize:Int):InputStream()
+class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAddress,rttTimeoutMultiplier:Double,initialSequenceNumber:Int,maxWindowSize:Int):InputStream()
 {
-    private var state:State = EstablishedState(this,ReceiveWindow(initialSequenceNumber,maxWindowSize),rttErrorMargin,rttTimeoutMultiplier)
+    private var state:State = EstablishedState(this,ReceiveWindow(initialSequenceNumber,maxWindowSize),rttTimeoutMultiplier)
     internal fun receive(packet:ISeqPacket) = state.receive(packet)
     override fun available():Int = state.available()
     override fun read():Int
@@ -41,24 +41,25 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
 
     private interface State
     {
-        fun receive(packet:ISeqPacket)
+        fun receive(packet:ISeqPacket):Boolean
         fun available():Int
         fun read(b:ByteArray,off:Int,len:Int):Int
         fun close()
     }
 
-    private class EstablishedState(val context:SocketInputStream,val recvWnd:ReceiveWindow,val rttErrorMargin:Long,val rttTimeoutMultiplier:Double):State
+    private class EstablishedState(val context:SocketInputStream,val recvWnd:ReceiveWindow,val rttTimeoutMultiplier:Double):State
     {
         private var estimatedRtt:Double = 0.0
 
         private var currentPayload = ByteBuffer.allocate(0)
 
-        override fun receive(packet:ISeqPacket)
+        override fun receive(packet:ISeqPacket):Boolean
         {
-            recvWnd.offer(packet)
+            val result = recvWnd.offer(packet)
             context.serverSocket.udpSocket.send(AckPacket(packet,positiveOffset(packet.sequenceNumber,recvWnd.lastSequenceNumber)).datagram)
             // todo: only take the latest rtt, not every single one
             estimatedRtt = packet.estimatedRtt
+            return result
         }
 
         override fun available():Int = currentPayload.remaining()
@@ -75,7 +76,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
                 }
                 else if (nextPacket is FinPacket)
                 {
-                    context.state = EofState(context,nextPacket,rttErrorMargin,rttTimeoutMultiplier)
+                    context.state = EofState(context,nextPacket,rttTimeoutMultiplier,recvWnd.lastSequenceNumber)
                     return context.state.read(b,off,len)
                 }
             }
@@ -88,10 +89,13 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
 
         override fun close()
         {
+            context.serverSocket.secondarySeqReceivers.put(context.remoteAddress,SocketInputStreamSeqReceiverAdapter(context))
+            context.serverSocket.primarySeqReceivers.remove(context.remoteAddress)
+
             val nextPacket = recvWnd.take()
             if (nextPacket is FinPacket)
             {
-                val eofState = EofState(context,nextPacket,rttErrorMargin,rttTimeoutMultiplier)
+                val eofState = EofState(context,nextPacket,rttTimeoutMultiplier,recvWnd.lastSequenceNumber)
                 context.state = eofState
                 eofState.awaitClosed()
             }
@@ -106,7 +110,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
     {
         init
         {
-            context.serverSocket.seqReceivers.remove(context.remoteAddress)
+            context.serverSocket.secondarySeqReceivers.remove(context.remoteAddress)
         }
         override fun receive(packet:ISeqPacket) = throw IllegalStateException("stream is closed")
         override fun available():Int = 0
@@ -114,7 +118,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
         override fun close() {}
     }
 
-    private class EofState(val context:SocketInputStream,finPacket:ISeqPacket,val rttErrorMargin:Long,val rttTimeoutMultiplier:Double):State
+    private class EofState(val context:SocketInputStream,finPacket:ISeqPacket,val rttTimeoutMultiplier:Double,val lastSequenceNumber:Int):State
     {
         var delayedCloseThread = Thread()
         val signaledOnClose = CountDownLatch(1)
@@ -122,16 +126,15 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
         {
             receive(finPacket)
         }
-        override fun receive(packet:ISeqPacket)
+        override fun receive(packet:ISeqPacket):Boolean
         {
-            assert(packet is FinPacket,{"output stream wasn't closed"})
+            context.serverSocket.udpSocket.send(AckPacket(packet,positiveOffset(packet.sequenceNumber,lastSequenceNumber)).datagram)
             delayedCloseThread.interrupt()
             delayedCloseThread = thread(name = "delayed close thread")
             {
                 try
                 {
-                    Thread.sleep((packet.estimatedRtt*rttTimeoutMultiplier+rttErrorMargin).toLong())
-                    context.serverSocket.seqReceivers.remove(context.remoteAddress)
+                    Thread.sleep((packet.estimatedRtt*rttTimeoutMultiplier).toLong())
                     context.state = ClosedState(context)
                     signaledOnClose.countDown()
                 }
@@ -140,6 +143,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
                     // do nothing
                 }
             }
+            return true
         }
         fun awaitClosed()
         {

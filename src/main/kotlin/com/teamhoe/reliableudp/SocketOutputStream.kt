@@ -15,9 +15,9 @@ import kotlin.concurrent.thread
 /**
  * Created by Eric on 4/7/2016.
  */
-class SocketOutputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAddress,initialSequenceNumber:Int,maxAllowedConsecutiveDroppedPackets:Int,estinatedRttErrorMargin:Long,initialEstimatedRtt:Double,initialMaxBytesInFlight:Double):OutputStream()
+class SocketOutputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAddress,initialSequenceNumber:Int,maxAllowedConsecutiveDroppedPackets:Int,initialEstimatedRttErrorMargin:Long,initialEstimatedRtt:Double,initialMaxBytesInFlight:Double):OutputStream()
 {
-    private var state:State = EstablishedState(this,initialSequenceNumber,CongestionWindow(estinatedRttErrorMargin,initialEstimatedRtt,initialMaxBytesInFlight),maxAllowedConsecutiveDroppedPackets)
+    private var state:State = EstablishedState(this,initialSequenceNumber,CongestionWindow(initialEstimatedRttErrorMargin,initialEstimatedRtt,initialMaxBytesInFlight),maxAllowedConsecutiveDroppedPackets)
     internal fun receive(packet:IAckPacket) = state.receive(packet)
     override fun write(b:Int) = write(byteArrayOf(b.toByte()))
     override fun write(b:ByteArray) = write(b,0,b.size)

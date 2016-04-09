@@ -23,10 +23,10 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
         const val NUM_SYN_TO_SEND_FOR_CONNECT:Int = 5
         const val DEFAULT_WINDOW_SIZE:Int = Int.MAX_VALUE
         const val MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS:Int = 3
-        const val ESTIMATED_RTT_ERR_MARGIN:Long = 500L
+        const val RTT_TIMEOUT_MULTIPLIER:Double = 2.0
+        const val INITIAL_ESTIMATED_RTT_ERR_MARGIN:Long = 500L
         const val INITIAL_ESTIMATED_RTT:Double = 5000.0
         const val INITIAL_MAX_BYTES_IN_FLIGHT:Double = 10.0
-        const val RTT_TIMEOUT_MULTIPLIER:Double = 2.0
 
         @Throws(IOException::class)
         fun make(port:Int? = null) = ServerSocket(port)
@@ -42,7 +42,9 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
 
     internal val ackReceivers:MutableMap<SocketAddress,AckReceiver> = LinkedHashMap()
 
-    internal val seqReceivers:MutableMap<SocketAddress,SeqReceiver> = LinkedHashMap()
+    internal val primarySeqReceivers:MutableMap<SocketAddress,SeqReceiver> = LinkedHashMap()
+
+    internal val secondarySeqReceivers:MutableMap<SocketAddress,SeqReceiver> = LinkedHashMap()
 
     private val pendingAcceptsQueue:Queue<SeqReceiver> = LinkedBlockingQueue()
 
@@ -58,18 +60,18 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
         // check for conflicting connection then register request to make sure
         // there is only one output stream to each remote address from this
         // socket
-        val seqReceiver = synchronized(seqReceivers)
+        val seqReceiver = synchronized(primarySeqReceivers)
         {
             if (remoteAddress != null)
             {
-                if (seqReceivers[remoteAddress] != null)
+                if (primarySeqReceivers[remoteAddress] != null)
                 {
                     throw IllegalArgumentException("conflicting ongoing connection present")
                 }
                 else
                 {
                     val seqReceiver = AcceptRequestSeqReceiverAdapter(AcceptRequest())
-                    seqReceivers[remoteAddress] = seqReceiver
+                    primarySeqReceivers[remoteAddress] = seqReceiver
                     return@synchronized seqReceiver
                 }
             }
@@ -87,11 +89,11 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
 
         // once connect request is received, remove accept request from pending
         // collection, and register a socket input stream in its place
-        val inputStream = SocketInputStream(this,acceptRequest.syn!!.remoteAddress,ESTIMATED_RTT_ERR_MARGIN,RTT_TIMEOUT_MULTIPLIER,acceptRequest.syn!!.sequenceNumber,DEFAULT_WINDOW_SIZE)
+        val inputStream = SocketInputStream(this,acceptRequest.syn!!.remoteAddress,RTT_TIMEOUT_MULTIPLIER,acceptRequest.syn!!.sequenceNumber,DEFAULT_WINDOW_SIZE)
         inputStream.receive(acceptRequest.syn!!)
-        synchronized(seqReceivers)
+        synchronized(primarySeqReceivers)
         {
-            seqReceivers[acceptRequest.syn!!.remoteAddress] = SocketInputStreamSeqReceiverAdapter(inputStream)
+            primarySeqReceivers[acceptRequest.syn!!.remoteAddress] = SocketInputStreamSeqReceiverAdapter(inputStream)
             if (remoteAddress == null)
             {
                 pendingAcceptsQueue.remove(seqReceiver)
@@ -143,7 +145,7 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
         // replace ack receiver with output stream otherwise
         else
         {
-            val outputStream = SocketOutputStream(this,remoteAddress,connectRequest.initialSequenceNumber+1,MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS,ESTIMATED_RTT_ERR_MARGIN,INITIAL_ESTIMATED_RTT,INITIAL_MAX_BYTES_IN_FLIGHT)
+            val outputStream = SocketOutputStream(this,remoteAddress,connectRequest.initialSequenceNumber+1,MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS,INITIAL_ESTIMATED_RTT_ERR_MARGIN,INITIAL_ESTIMATED_RTT,INITIAL_MAX_BYTES_IN_FLIGHT)
             synchronized(ackReceivers) {ackReceivers[remoteAddress] = SocketOutputStreamAckReceiverAdapter(outputStream)}
             return outputStream
         }
@@ -170,7 +172,13 @@ class ServerSocket private constructor(val port:Int? = null):Closeable
             // let sequenced packets be handled by input streams
                 is ISeqPacket ->
                 {
-                    (seqReceivers[packet.remoteAddress] ?: pendingAcceptsQueue.firstOrNull())?.receive(packet)
+                    if (primarySeqReceivers[packet.remoteAddress]?.receive(packet) != true)
+                    {
+                        if (pendingAcceptsQueue.firstOrNull()?.receive(packet) != true)
+                        {
+                            secondarySeqReceivers[packet.remoteAddress]?.receive(packet)
+                        }
+                    }
                 }
 
             // let acknowledgement packets be handled by output streams
@@ -264,12 +272,17 @@ private class AcceptRequest()
         }
     }
 
-    fun receive(seqPacket:ISeqPacket)
+    fun receive(seqPacket:ISeqPacket):Boolean
     {
         if (isVirgin() && seqPacket is SynPacket)
         {
             syn = seqPacket
             releasedOnEstablished.countDown()
+            return true
+        }
+        else
+        {
+            return false
         }
     }
 
@@ -278,7 +291,7 @@ private class AcceptRequest()
 
 internal interface SeqReceiver
 {
-    fun receive(packet:ISeqPacket)
+    fun receive(packet:ISeqPacket):Boolean
 }
 
 private class AcceptRequestSeqReceiverAdapter(val wrapee:AcceptRequest):SeqReceiver
@@ -286,7 +299,7 @@ private class AcceptRequestSeqReceiverAdapter(val wrapee:AcceptRequest):SeqRecei
     override fun receive(packet:ISeqPacket) = wrapee.receive(packet)
 }
 
-private class SocketInputStreamSeqReceiverAdapter(val wrapee:SocketInputStream):SeqReceiver
+internal class SocketInputStreamSeqReceiverAdapter(val wrapee:SocketInputStream):SeqReceiver
 {
     override fun receive(packet:ISeqPacket) = wrapee.receive(packet)
 }

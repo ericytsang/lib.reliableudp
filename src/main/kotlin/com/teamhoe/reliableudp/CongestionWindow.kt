@@ -6,14 +6,18 @@ import java.util.concurrent.*
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimatedRtt:Double,initialMaxBytesInFlight:Double)
+internal class CongestionWindow(initialEstimatedRttErrorMargin:Long,initialEstimatedRtt:Double,initialMaxBytesInFlight:Double)
 {
     var isSlowStart = true
+
+    var estimatedRttErrorMargin:Long = initialEstimatedRttErrorMargin
+        private set
 
     /**
      * the estimated round trip time of the connection.
      */
     var estimatedRtt:Double = initialEstimatedRtt
+        private set
 
     /**
      * current maximum that [bytesInFlight] should not exceed, however,
@@ -107,8 +111,10 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
                     maxBytesInFlight += (packetLength.toFloat()/Math.max(maxBytesInFlight.toFloat()/packetLength.toFloat(),1.0F))
 
                 // update estimated round trip time
-                val packetRtt = System.currentTimeMillis()-it.initialTransmissionTime+estimatedRttErrorMargin
-                estimatedRtt += (0.75*(packetRtt-estimatedRtt)).toLong()
+                val packetRtt = System.currentTimeMillis()-it.initialTransmissionTime
+                val packetRttEror = Math.abs(packetRtt-estimatedRtt)
+                estimatedRttErrorMargin += (0.1*(packetRttEror-estimatedRttErrorMargin)).toLong()
+                estimatedRtt += (0.1*(packetRtt-estimatedRtt)).toLong()
             }
 
             // return true to remove; false otherwise
@@ -147,7 +153,7 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
         // are acknowledged
         val packetInFlight = packetsInFlight.take()
         val packet = packetInFlight.packet
-        packetsInFlight.put(PacketInFlight(packet,packetInFlight.initialTransmissionTime,estimatedRtt.toLong(),true))
+        packetsInFlight.put(PacketInFlight(packet,packetInFlight.initialTransmissionTime,estimatedRtt.toLong()+estimatedRttErrorMargin*2,true))
 
         // update perceived network status
         if (packetInFlight.isRetransmission)
