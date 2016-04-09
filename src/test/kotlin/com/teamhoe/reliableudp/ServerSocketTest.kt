@@ -15,10 +15,10 @@ class ServerSocketTest
     @Test
     fun serverSocketOpensOnPort()
     {
-        val ss = ServerSocket()
+        val ss = ServerSocket.make()
         val port = ss.localPort
         ss.close()
-        val ss2 = ServerSocket(port)
+        val ss2 = ServerSocket.make(port)
         assert(ss2.localPort == port)
         ss2.close()
     }
@@ -27,34 +27,74 @@ class ServerSocketTest
     fun simplexTraffic()
     {
         val rendezvous = CyclicBarrier(2)
+        val svrSocket1 = ServerSocket.make(7000)
+        val svrSocket2 = ServerSocket.make(7001)
         val t1 = thread(name = "t1")
         {
-            val svrSocket = ServerSocket(7006)
             rendezvous.await()
 
-            val ins = DataInputStream(svrSocket.accept())
-            repeat(5)
+            val ins = DataInputStream(svrSocket1.accept())
+            repeat(5000)
             {
                 println(">>>: ${ins.readUTF()}")
             }
-            svrSocket.close()
+            ins.close()
+            System.err.println("closed input")
         }
         val t2 = thread(name = "t2")
         {
-            val svrSocket = ServerSocket()
             rendezvous.await()
             Thread.sleep(10)
 
-            val outs = DataOutputStream(svrSocket.connect(InetSocketAddress("localhost",7006)))
-            for (i in 1..5)
+            val outs = DataOutputStream(svrSocket2.connect(InetSocketAddress("localhost",7005)))
+            for (i in 1..5000)
             {
                 outs.writeUTF("transmit $i")
             }
-            outs.flush()
-            svrSocket.close()
+            outs.close()
+            System.err.println("closed output")
         }
         t1.join()
         t2.join()
+        svrSocket1.close()
+        svrSocket2.close()
+    }
+
+    @Test
+    fun simplexTraffic2()
+    {
+        val rendezvous = CyclicBarrier(2)
+        val svrSocket1 = ServerSocket.make(7000)
+        val svrSocket2 = ServerSocket.make(7001)
+        val t1 = thread(name = "t1")
+        {
+            rendezvous.await()
+
+            val ins = DataInputStream(svrSocket1.accept())
+            repeat(5000)
+            {
+                println(">>>: ${ins.readUTF()}")
+            }
+            ins.close()
+            System.err.println("closed input")
+        }
+        val t2 = thread(name = "t2")
+        {
+            rendezvous.await()
+            Thread.sleep(10)
+
+            val outs = DataOutputStream(svrSocket2.connect(InetSocketAddress("localhost",7005)))
+            for (i in 1..5000)
+            {
+                outs.writeUTF("transmit $i")
+            }
+            outs.close()
+            System.err.println("closed output")
+        }
+        t1.join()
+        t2.join()
+        svrSocket1.close()
+        svrSocket2.close()
     }
 
     @Test
@@ -63,7 +103,7 @@ class ServerSocketTest
         val rendezvous = CyclicBarrier(2)
         val t1 = thread(name = "t1")
         {
-            val svrSocket = ServerSocket(7006)
+            val svrSocket = ServerSocket.make(7006)
             rendezvous.await()
 
             val ins = svrSocket.accept()
@@ -75,7 +115,7 @@ class ServerSocketTest
         }
         val t2 = thread(name = "t2")
         {
-            val svrSocket = ServerSocket()
+            val svrSocket = ServerSocket.make()
             rendezvous.await()
             Thread.sleep(10)
 

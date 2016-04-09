@@ -9,7 +9,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.net.SocketAddress
 import java.nio.ByteBuffer
-import java.util.LinkedList
+import java.util.*
 import kotlin.concurrent.thread
 
 /**
@@ -33,7 +33,7 @@ class SocketOutputStream(val serverSocket:ServerSocket,val remoteAddress:SocketA
         fun close()
     }
 
-    private class EstablishedState(val context:SocketOutputStream,initialSequenceNumber:Int,val congWnd:CongestionWindow,val maxAllowedConsecutiveDroppedPackets:Int):State
+    private class EstablishedState(val context:SocketOutputStream,initialSequenceNumber:Int,val congWnd:CongestionWindow,val maxAllowedConsecutiveDroppedPacketsPerPacket:Int):State
     {
         private var nextSequenceNumber:Int = initialSequenceNumber
             get()
@@ -42,6 +42,8 @@ class SocketOutputStream(val serverSocket:ServerSocket,val remoteAddress:SocketA
                 field += 1
                 return field-1
             }
+
+        private var sendingThreads:MutableSet<Thread> = LinkedHashSet()
 
         override fun write(b:ByteArray,off:Int,len:Int)
         {
@@ -52,20 +54,44 @@ class SocketOutputStream(val serverSocket:ServerSocket,val remoteAddress:SocketA
             {
                 val datagramPayload = ByteArray(Math.min(maxPayloadLength,data.remaining()))
                 data.get(datagramPayload)
-                packets.add(DataPacket(context.remoteAddress,nextSequenceNumber,datagramPayload))
+                packets.add(DataPacket(context.remoteAddress,nextSequenceNumber,congWnd.estimatedRtt,datagramPayload))
             }
-            congWnd.put(packets)
+            try
+            {
+                sendingThreads.add(Thread.currentThread())
+                congWnd.put(packets)
+            }
+            catch (ex:InterruptedException)
+            {
+                context.state.write(b,off,len)
+            }
+            finally
+            {
+                sendingThreads.remove(Thread.currentThread())
+            }
         }
 
         override fun flush()
         {
-            congWnd.flush()
+            try
+            {
+                sendingThreads.add(Thread.currentThread())
+                congWnd.flush()
+            }
+            catch (ex:InterruptedException)
+            {
+                context.state.flush()
+            }
+            finally
+            {
+                sendingThreads.remove(Thread.currentThread())
+            }
         }
 
         override fun close()
         {
             // add fin packet
-            congWnd.put(listOf(FinPacket(context.remoteAddress,nextSequenceNumber)))
+            congWnd.put(listOf(FinPacket(context.remoteAddress,nextSequenceNumber,congWnd.estimatedRtt)))
 
             // flush all the congestion window
             flush()
@@ -90,13 +116,17 @@ class SocketOutputStream(val serverSocket:ServerSocket,val remoteAddress:SocketA
                 {
                     // send the next packet given to us by the congestion window
                     val packet = congWnd.take()
-                    context.serverSocket.udpSocket.send(packet.datagram)
 
                     // switch to the error state if dropped too many packets
-                    if (congWnd.consecutiveDroppedPacketCount > maxAllowedConsecutiveDroppedPackets)
+                    if (congWnd.consecutiveDroppedPacketCount > congWnd.numPacketsInFlight*maxAllowedConsecutiveDroppedPacketsPerPacket)
                     {
                         context.state = ErrorState(context)
+                        sendingThreads.forEach {it.interrupt()}
                         break
+                    }
+                    else
+                    {
+                        context.serverSocket.udpSocket.send(packet.datagram)
                     }
                 }
             }

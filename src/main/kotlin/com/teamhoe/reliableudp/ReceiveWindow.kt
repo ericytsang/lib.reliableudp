@@ -61,6 +61,14 @@ internal class ReceiveWindow(initialSequenceNumber:Int,val maxWindowSize:Int)
     }
 
     /**
+     * returns the next consecutive [ISeqPacket]; null if unavailable.
+     */
+    fun poll():ISeqPacket? = synchronized(releasedOnPacketAdded)
+    {
+        return packets[nextSequenceNumber]
+    }
+
+    /**
      * returns the next consecutive [ISeqPacket]; blocks if necessary until it
      * is available.
      */

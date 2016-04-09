@@ -2,6 +2,7 @@ package com.teamhoe.reliableudp
 
 import com.teamhoe.reliableudp.net.*
 import java.io.Closeable
+import java.io.IOException
 import java.net.ConnectException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -15,17 +16,25 @@ import kotlin.concurrent.thread
 /**
  * Created by Eric on 4/7/2016.
  */
-class ServerSocket(private val port:Int? = null):Closeable
+class ServerSocket private constructor(val port:Int? = null):Closeable
 {
     companion object
     {
-        const val NUM_SYN_TO_SEND_FOR_CONNECT = 5
-        const val DEFAULT_WINDOW_SIZE = Int.MAX_VALUE
-        const val MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS = 3
-        const val ESTIMATED_RTT_ERR_MARGIN = 500L
-        const val INITIAL_ESTIMATED_RTT = 5000.0
-        const val INITIAL_MAX_BYTES_IN_FLIGHT = 1.0
+        const val NUM_SYN_TO_SEND_FOR_CONNECT:Int = 5
+        const val DEFAULT_WINDOW_SIZE:Int = 5000
+        const val MAX_ALLOWED_CONSECUTIVE_DROPPED_PACKETS:Int = 3
+        const val ESTIMATED_RTT_ERR_MARGIN:Long = 100L
+        const val INITIAL_ESTIMATED_RTT:Double = 5000.0
+        const val INITIAL_MAX_BYTES_IN_FLIGHT:Double = 10.0
+        const val RTT_TIMEOUT_MULTIPLIER:Long = 1L
+
+        @Throws(IOException::class)
+        fun make(port:Int? = null) = ServerSocket(port)
     }
+
+    val isClosed:Boolean get() = udpSocket.isClosed
+
+    val isBound:Boolean get() = udpSocket.isBound
 
     val localPort:Int get() = udpSocket.localPort
 
@@ -35,32 +44,52 @@ class ServerSocket(private val port:Int? = null):Closeable
 
     internal val seqReceivers:MutableMap<SocketAddress,SeqReceiver> = LinkedHashMap()
 
-    private val pendingAccepts:Queue<SeqReceiver> = LinkedBlockingQueue()
+    private val pendingAcceptsQueue:Queue<SeqReceiver> = LinkedBlockingQueue()
+
+    private val pendingAcceptsMap:MutableMap<SocketAddress,SeqReceiver> = LinkedHashMap()
 
     /**
      * blocks until a connection request was received, and accepted. returns a
      * [SocketInputStream].
      */
-    fun accept(timeout:Long? = null):SocketInputStream
+    @Throws(IOException::class)
+    fun accept(remoteAddress:SocketAddress? = null,timeout:Long? = null):SocketInputStream
     {
+        assert(isBound && !isClosed)
+
         val seqReceiver = AcceptRequestSeqReceiverAdapter(AcceptRequest())
         val acceptRequest = seqReceiver.wrapee
 
         // registers input stream into queue of input streams pending to accept
         // new connection requests
-        pendingAccepts.add(seqReceiver)
+        if (remoteAddress != null)
+        {
+            pendingAcceptsMap[remoteAddress] = seqReceiver
+        }
+        else
+        {
+            pendingAcceptsQueue.add(seqReceiver)
+        }
 
         // await acceptance of connection request
         acceptRequest.awaitEstablished(timeout)
 
         // once connect request is received, remove accept request from pending
         // collection, and register a socket input stream in its place
-        val inputStream = SocketInputStream(this,acceptRequest.syn!!.remoteAddress,acceptRequest.syn!!.sequenceNumber,DEFAULT_WINDOW_SIZE)
+        val inputStream = SocketInputStream(this,acceptRequest.syn!!.remoteAddress,RTT_TIMEOUT_MULTIPLIER,acceptRequest.syn!!.sequenceNumber,DEFAULT_WINDOW_SIZE)
         inputStream.receive(acceptRequest.syn!!)
         synchronized(seqReceivers)
         {
             seqReceivers[acceptRequest.syn!!.remoteAddress] = SocketInputStreamSeqReceiverAdapter(inputStream)
-            pendingAccepts.remove(seqReceiver)
+            if (remoteAddress != null)
+            {
+                pendingAcceptsMap.remove(remoteAddress)
+            }
+            else
+            {
+                pendingAcceptsQueue.remove(seqReceiver)
+            }
+            Unit
         }
         return inputStream
     }
@@ -72,8 +101,11 @@ class ServerSocket(private val port:Int? = null):Closeable
      * [remoteAddress]. throws [ConnectException] if the connection request
      * times out.
      */
+    @Throws(IOException::class,ConnectException::class)
     fun connect(remoteAddress:SocketAddress,timeout:Long? = null):SocketOutputStream
     {
+        assert(isBound && !isClosed)
+
         // check for conflicting connection then register request to make sure
         // there is only one output stream to each remote address from this
         // socket
@@ -110,6 +142,7 @@ class ServerSocket(private val port:Int? = null):Closeable
         }
     }
 
+    @Throws(IOException::class)
     override fun close()
     {
         udpSocket.close()
@@ -118,7 +151,7 @@ class ServerSocket(private val port:Int? = null):Closeable
     private val receiveThread = thread(isDaemon = true,name = "$this.receiveThread")
     {
         val datagram = DatagramPacket(ByteArray(NetUtils.MAX_IP_PACKET_LEN),NetUtils.MAX_IP_PACKET_LEN)
-        while (!udpSocket.isClosed)
+        while (!isClosed)
         {
             // receive and parse next datagram
             udpSocket.receive(datagram)
@@ -130,7 +163,7 @@ class ServerSocket(private val port:Int? = null):Closeable
             // let sequenced packets be handled by input streams
                 is ISeqPacket ->
                 {
-                    (seqReceivers[packet.remoteAddress] ?: pendingAccepts.firstOrNull())?.receive(packet)
+                    (seqReceivers[packet.remoteAddress] ?: pendingAcceptsMap[packet.remoteAddress] ?: pendingAcceptsQueue.firstOrNull())?.receive(packet)
                 }
 
             // let acknowledgement packets be handled by output streams
@@ -160,7 +193,7 @@ private class ConnectRequest(val remoteAddress:SocketAddress,val udpSocket:Datag
         // send syn packets
         repeat(ServerSocket.NUM_SYN_TO_SEND_FOR_CONNECT)
         {
-            val syn = SynPacket(remoteAddress,initialSequenceNumber)
+            val syn = SynPacket(remoteAddress,initialSequenceNumber,ServerSocket.INITIAL_ESTIMATED_RTT)
             udpSocket.send(syn.datagram)
         }
 

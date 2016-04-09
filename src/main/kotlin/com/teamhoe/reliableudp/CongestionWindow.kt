@@ -1,12 +1,9 @@
 package com.teamhoe.reliableudp.net
 
-import com.teamhoe.reliableudp.utils.Timestamped
 import com.teamhoe.reliableudp.utils.UnsignedInt
 import com.teamhoe.reliableudp.utils.positiveOffset
-import java.util.*
 import java.util.concurrent.*
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 
 internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimatedRtt:Double,initialMaxBytesInFlight:Double)
@@ -25,6 +22,16 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
      * refrains from sending data.
      */
     private var maxBytesInFlight:Double = initialMaxBytesInFlight
+        set(value)
+        {
+            field = Math.max(0.0,value)
+        }
+
+    /**
+     * the last sequence number we're allowed to send as specified by remote
+     * host via acknowledgements.
+     */
+    private var maxSequenceNumber:Int? = null
 
     /**
      * current number of unacknowledged data in bytes; bytes that are still
@@ -33,54 +40,50 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
     private val bytesInFlight:Int
         get()
         {
-            return pendingForAckPackets.sumBy {it.packet.datagram.length}
+            assert(packetsInFlightAccess.isHeldByCurrentThread)
+            return packetsInFlight.sumBy {it.packet.datagram.length}
         }
 
-    private val lock = ReentrantLock()
+    private val packetsInFlightAccess = ReentrantLock()
 
-    private val signaledOnNetworkAvailable = lock.newCondition()
+    private val signaledOnAck = packetsInFlightAccess.newCondition()
+
+    /**
+     * packets that have been transmitted and are waiting to be acknowledged.
+     * packets that time out and are re-queued and immediately and
+     * retransmitted.
+     */
+    private val packetsInFlight = DelayQueue<PacketInFlight>()
 
     /**
      * queue of all packets in the congestion window in the order that they
      * were [put], regardless of being retransmitted.
      */
-    private val unackedPackets = LinkedBlockingQueue<Timestamped<ISeqPacket>>()
+    private val unackedPackets = LinkedBlockingQueue<ISeqPacket>()
+
+    var consecutiveDroppedPacketCount:Int = 0
+        private set
+
+    val numPacketsInFlight:Int get() = packetsInFlight.size
 
     /**
-     * prioritized by order they should be sent in. queue of packets waiting
-     * to be sent. should hold pending packets to transmit or retransmit.
+     * put a packet into the congestion window.
      */
-    private val pendingToSendPackets = PriorityBlockingQueue<ISeqPacket>(100,
-        Comparator<ISeqPacket>
-        {
-            o1,o2 ->
-            val relativeSequence1 = positiveOffset(unackedPackets.last().obj.sequenceNumber,o1.sequenceNumber)
-            val relativeSequence2 = positiveOffset(unackedPackets.last().obj.sequenceNumber,o2.sequenceNumber)
-            val difference = relativeSequence1-relativeSequence2
-            difference.coerceIn(-1L..1L).toInt()
-        })
-
-    /**
-     * packets waiting to be acknowledged. packets that time out and are
-     * re-queued and also are placed back into the [pendingToSendPackets]. should
-     * hold packets that have been transmitted at least once.
-     */
-    private val pendingForAckPackets = DelayQueue<DelayedPacket>()
-
-    private var maxSequenceNumber:Int? = null
-
-    /**
-     * put a packet into the congestion window for transmission.
-     */
-    fun put(packets:Iterable<ISeqPacket>):Unit = lock.withLock()
+    fun put(packets:Iterable<ISeqPacket>):Unit = packetsInFlightAccess.withLock()
     {
         packets.forEach()
         {
-            // put the packet into the queue so we can calculate RTT
-            unackedPackets.add(Timestamped(it))
+            packet ->
 
-            // add the packet to the [pendingToSendPackets] for sending
-            pendingToSendPackets.add(it)
+            // wait for room on the network, and in packets in flight
+            while (bytesInFlight > maxBytesInFlight)
+            {
+                signaledOnAck.await()
+            }
+
+            // add packet to packets in flight
+            unackedPackets.add(packet)
+            packetsInFlight.add(PacketInFlight(packet,System.currentTimeMillis(),0,false))
         }
     }
 
@@ -88,147 +91,106 @@ internal class CongestionWindow(val estimatedRttErrorMargin:Long,initialEstimate
      * acknowledge that a transmitted or retransmitted packet was acknowledged
      * by the remote host.
      */
-    fun ack(acknowledgementNumber:Int,windowSize:UnsignedInt):Unit = lock.withLock()
+    fun ack(acknowledgementNumber:Int,windowSize:UnsignedInt):Unit = packetsInFlightAccess.withLock()
     {
-        pendingForAckPackets.removeAll()
+        // remove packet from packets in flight & update perceived network state
+        packetsInFlight.removeAll()
         {
             val shouldRemove = it.packet.sequenceNumber == acknowledgementNumber
             if (shouldRemove)
             {
                 // bytes in flight book keeping
                 val packetLength = it.packet.datagram.length
-                // todo change these params too
                 if (isSlowStart)
                     maxBytesInFlight += packetLength
                 else
                     maxBytesInFlight += (packetLength.toFloat()/(bytesInFlight/packetLength.toFloat()))*10
-            }
 
-            // return true to remove; false otherwise
-            return@removeAll shouldRemove
-        }
-
-        // abort retransmissions of the acknowledged packet
-        pendingToSendPackets.removeAll()
-        {
-            return@removeAll it.sequenceNumber == acknowledgementNumber
-        }
-
-        // remove the packet from collection and update estimated RTT
-        unackedPackets.removeAll()
-        {
-            val shouldRemove = it.obj.sequenceNumber == acknowledgementNumber
-            if (shouldRemove)
-            {
                 // update estimated round trip time
-                val packetRtt = System.currentTimeMillis()-it.timestamp+estimatedRttErrorMargin
+                val packetRtt = System.currentTimeMillis()-it.initialTransmissionTime+estimatedRttErrorMargin
                 estimatedRtt += (0.1*(packetRtt-estimatedRtt)).toLong()
             }
 
             // return true to remove; false otherwise
             return@removeAll shouldRemove
         }
+        unackedPackets.removeAll()
+        {
+            it.sequenceNumber == acknowledgementNumber
+        }
 
-        // reset consecutive dropped packet count
+        // reset dropped packet count
         consecutiveDroppedPacketCount = 0
 
         // update remote receive window size
         maxSequenceNumber = (acknowledgementNumber.toLong()+windowSize.value).toInt()
 
         // signal condition met
-        if (bytesInFlight < maxBytesInFlight)
-            signaledOnNetworkAvailable.signalAll()
+        signaledOnAck.signalAll()
     }
 
-    fun flush() = lock.withLock()
+    fun flush() = packetsInFlightAccess.withLock()
     {
-        while(unackedPackets.isNotEmpty() || pendingToSendPackets.isNotEmpty() || pendingForAckPackets.isNotEmpty())
-            signaledOnNetworkAvailable.await()
+        while(packetsInFlight.isNotEmpty())
+        {
+            signaledOnAck.await()
+        }
     }
 
     /**
-     * removes the next packet that is ready for transmission or retransmission
-     * because the network is free.
+     * removes the next packet that is ready for transmission or retransmission.
      */
-    var consecutiveDroppedPacketCount = 0
-        private set
-    var packetsDropped = 0
     fun take():ISeqPacket
     {
-        lock.withLock()
-        {
-            // wait for room on the network to send a packet so we don't
-            // overwhelm the network with packets.
-            while (bytesInFlight > maxBytesInFlight)
-                signaledOnNetworkAvailable.await()
-        }
+        // remove the next packet for transmission, but put them back into
+        // packets in flight, because they should only be removed once they
+        // are acknowledged
+        val packetInFlight = packetsInFlight.take()
+        val packet = packetInFlight.packet
+        packetsInFlight.put(PacketInFlight(packet,packetInFlight.initialTransmissionTime,estimatedRtt.toLong(),true))
 
-        var retransmitThread = thread(name = "retransmitThread")
+        // update perceived network status
+        if (packetInFlight.isRetransmission)
         {
-            // packets removed from [pendingForAckPackets] have
-            // timed out before they got acked; put them back in for
-            // retransmission.
-            val delayedPacket = try
-            {
-                pendingForAckPackets.take()
-            }
-            catch(ex:InterruptedException)
-            {
-                return@thread
-            }
-            pendingForAckPackets.put(delayedPacket)
-            val packet = delayedPacket.packet
-
-            // todo: tweak deez parameters
-            estimatedRtt = Math.min(estimatedRtt*2,Double.MAX_VALUE)
+            // estimatedRtt = Math.min(estimatedRtt*2,Double.MAX_VALUE)
             isSlowStart = false
             maxBytesInFlight -= packet.datagram.length
             consecutiveDroppedPacketCount++
-            rePut(packet)
-
-            println("$this: estimatedRtt: $estimatedRtt, maxBytesInFlight: ${maxBytesInFlight}, packetsDropped: ${++packetsDropped}")
         }
 
-        // send the next packet & update book keeping
-        val packetToSend = pendingToSendPackets.take()
-        pendingForAckPackets.add(DelayedPacket(packetToSend))
-        retransmitThread.interrupt()        // stop the retransmit thread if it's still waiting on take()
-
-        lock.withLock()
+        // wait for room in the remote receive window to send a packet so we
+        // don't overwhelm the remote host with packets.
+        packetsInFlightAccess.withLock()
         {
-            // wait for room in the remote receive window to send a packet so we
-            // don't overwhelm the remote host with packets.
-            while (positiveOffset(packetToSend.sequenceNumber,maxSequenceNumber ?: packetToSend.sequenceNumber+1) <= 0)
-                signaledOnNetworkAvailable.await()
+            while (positiveOffset(packet.sequenceNumber,maxSequenceNumber ?: packet.sequenceNumber+1) <= 0)
+                signaledOnAck.await()
         }
 
-        return packetToSend
+        return packet
     }
 
-    /**
-     * re-enqueue a packet into the congestion window for retransmission.
-     */
-    private fun rePut(packet:ISeqPacket)
+    private inner class PacketInFlight(val packet:ISeqPacket,val initialTransmissionTime:Long,val delay:Long,val isRetransmission:Boolean):Delayed
     {
-        // add the packet to the [pendingToSendPackets] for sending
-        pendingToSendPackets.add(packet)
-    }
-
-    private inner class DelayedPacket(val packet:ISeqPacket):Delayed
-    {
-        private val timestampedPacket = Timestamped(packet)
+        val timeTransmitted = System.currentTimeMillis()
 
         override fun getDelay(unit:TimeUnit):Long
         {
-            val dequeueTimeMillis = timestampedPacket.timestamp+estimatedRtt.toLong()
+            val dequeueTimeMillis = timeTransmitted+delay
             val delay = dequeueTimeMillis-System.currentTimeMillis()
             return Math.min(unit.convert(delay,TimeUnit.MILLISECONDS),1000)
         }
 
         override fun compareTo(other:Delayed):Int
         {
-            return (getDelay(TimeUnit.MILLISECONDS)-other.getDelay(TimeUnit.MILLISECONDS))
-                .coerceIn(-1L..1L).toInt()
+            var result = (getDelay(TimeUnit.MILLISECONDS)-other.getDelay(TimeUnit.MILLISECONDS)).coerceIn(-1L..1L).toInt()
+            if (result == 0 && other is PacketInFlight)
+            {
+                val relativeSequence1 = positiveOffset(unackedPackets.last().sequenceNumber,packet.sequenceNumber)
+                val relativeSequence2 = positiveOffset(unackedPackets.last().sequenceNumber,other.packet.sequenceNumber)
+                val difference = relativeSequence1-relativeSequence2
+                result = difference.coerceIn(-1L..1L).toInt()
+            }
+            return result
         }
     }
 }

@@ -18,13 +18,11 @@ internal fun isInRange(num:Int,offset:Int,length:Int):Boolean
 }
 
 /**
- * returns the smallest absolute difference between num, and offset.
- * accounts for overflow.
+ * returns an integer where [src] + integer == [dst]. this method takes overflow
+ * into account
  */
 internal fun positiveOffset(src:Int,dst:Int):Long
 {
     if(dst >= src) return (dst-src).toLong()
     else return positiveOffset(src,Int.MAX_VALUE)+positiveOffset(Int.MIN_VALUE,dst)+1
 }
-
-internal data class Timestamped<Type>(val obj:Type,val timestamp:Long = System.currentTimeMillis())
