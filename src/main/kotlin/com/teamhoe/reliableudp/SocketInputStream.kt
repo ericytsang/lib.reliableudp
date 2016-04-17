@@ -112,7 +112,7 @@ class SocketInputStream(val serverSocket:ServerSocket,val remoteAddress:SocketAd
         {
             context.serverSocket.secondarySeqReceivers.remove(context.remoteAddress)
         }
-        override fun receive(packet:ISeqPacket) = throw IllegalStateException("stream is closed")
+        override fun receive(packet:ISeqPacket) = false
         override fun available():Int = 0
         override fun read(b:ByteArray,off:Int,len:Int):Int = throw IOException("stream is closed")
         override fun close() {}

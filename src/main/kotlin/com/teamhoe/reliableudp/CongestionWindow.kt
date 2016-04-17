@@ -153,11 +153,13 @@ internal class CongestionWindow(initialEstimatedRttErrorMargin:Long,initialEstim
         // are acknowledged
         val packetInFlight = packetsInFlight.take()
         val packet = packetInFlight.packet
-        packetsInFlight.put(PacketInFlight(packet,packetInFlight.initialTransmissionTime,estimatedRtt.toLong()+estimatedRttErrorMargin*2,true))
+//        println("estimatedRtt: $estimatedRtt estimatedRttErrorMargin: $estimatedRttErrorMargin")
+        packetsInFlight.put(PacketInFlight(packet,packetInFlight.initialTransmissionTime,estimatedRtt.toLong()+estimatedRttErrorMargin*4,true))
 
         // update perceived network status
         if (packetInFlight.isRetransmission)
         {
+//            println("Retransmit!")
             // estimatedRtt = Math.min(estimatedRtt*2,Double.MAX_VALUE)
             isSlowStart = false
             maxBytesInFlight -= packet.datagram.length
